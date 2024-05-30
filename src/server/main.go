@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -22,8 +23,8 @@ type config struct {
 
 func loadConfig() config {
 	return config{
-		postgresConnectionString: "postgres://debug:debug@localhost:5432/wbtech?sslmode=disable",
-		natsConnectionString:     "nats://0.0.0.0:4222",
+		postgresConnectionString: "postgres://debug:debug@db:5432/wbtech?sslmode=disable",
+		natsConnectionString:     "nats://nats:4222",
 	}
 }
 
@@ -39,54 +40,92 @@ func main() {
 func run() error {
 	ctx := context.Background()
 	cfg := loadConfig()
-	conn, err := ConnectDb(ctx, cfg)
 
+	conn, err := ConnectDb(ctx, cfg)
 	if err != nil {
-		// доробать возвращение ошибки
+		log.Fatalf("error connect to database: %v", err)
 		return err
 	}
+
 	var cacheMx sync.RWMutex
 	cache, err := GetData(ctx, conn)
-
 	if err != nil {
-		// доробать возвращение ошибки
+		log.Fatalf("error get data in cache: %v", err)
 		return err
 	}
+
 	nc, err := ConnectNats(ctx, cfg)
 	if err != nil {
-		// доробать возвращение ошибки
+		log.Fatalf("error connect to nuts: %v", err)
 		return err
 	}
-	// горутина обслуживает сообщения из натс и добавляет бд
-	go consumeData(ctx, nc, conn)
+	defer nc.Close()
 
-	http.ListenAndServe(":8080", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// горутина обслуживает сообщения из натс и добавляет бд
+	go consumeData(ctx, nc, conn, cache, &cacheMx)
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		fmt.Printf("%#v\n", r.Method)
+		if r.Method == http.MethodOptions {
+			fmt.Printf("%#v\n", r)
+			return
+		}
+
+		fmt.Println("Received request:", r.URL.Path)
+
+		if r.URL.Path == "/orders" {
+			if r.Method == http.MethodGet {
+				content, err := ioutil.ReadFile("static/index.html")
+				if err != nil {
+					http.Error(w, "Could not read index.html", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "text/html")
+				w.WriteHeader(http.StatusOK)
+				w.Write(content)
+				return
+			} else {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+		}
+
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+
 		path := strings.Trim(r.URL.Path, "/")
 		if path == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+
 		cacheMx.Lock()
 		defer cacheMx.Unlock()
 
 		order, ok := cache[path]
-
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+
 		data, err := json.Marshal(order)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		w.Write(data)
-	}))
 
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+	})
+
+	fmt.Println("Server is running on http://0.0.0.0:8080")
+	http.ListenAndServe(":8080", nil)
 	return nil
 }
 
@@ -108,31 +147,104 @@ func ConnectNats(ctx context.Context, cfg config) (*nats.Conn, error) {
 	url := cfg.natsConnectionString
 	nc, err := nats.Connect(url)
 	if err != nil {
-		log.Fatalf("Error connecting to NATS: %v", err)
+		log.Fatalf("error connecting to NATS: %v", err)
 	}
 	return nc, nil
 }
 
-// запрос в бд достаем за обращение n-элементов, возвращаем model.Order, рабоатет пока двнные не закончатся
 func GetData(ctx context.Context, conn *pgx.Conn) (map[string]model.Order, error) {
-	return map[string]model.Order{}, nil
+	orders := make(map[string]model.Order)
+
+	rows, err := conn.Query(ctx, `
+        SELECT
+            o.order_uid, o.track_number, o.entry, o.locale, o.internal_signature,
+            o.customer_id, o.delivery_service, o.shardkey, o.sm_id, o.date_created, o.oof_shard,
+            d.name, d.phone, d.zip, d.city, d.address, d.region, d.email,
+            p.transaction, p.request_id, p.currency, p.provider, p.amount, p.payment_dt, p.bank,
+            p.delivery_cost, p.goods_total, p.custom_fee
+        FROM orders o
+        JOIN deliveries d ON o.order_uid = d.order_uid
+        JOIN payments p ON o.order_uid = p.order_uid
+    `)
+	if err != nil {
+		return nil, fmt.Errorf("unable to retrieve orders from database: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var order model.Order
+		var delivery model.Delivery
+		var payment model.Payment
+
+		err := rows.Scan(
+			&order.OrderUID, &order.TrackNumber, &order.Entry, &order.Locale, &order.InternalSignature,
+			&order.CustomerID, &order.DeliveryService, &order.Shardkey, &order.SmID, &order.DateCreated, &order.OofShard,
+			&delivery.Name, &delivery.Phone, &delivery.Zip, &delivery.City, &delivery.Address, &delivery.Region, &delivery.Email,
+			&payment.Transaction, &payment.RequestID, &payment.Currency, &payment.Provider, &payment.Amount, &payment.PaymentDT, &payment.Bank,
+			&payment.DeliveryCost, &payment.GoodsTotal, &payment.CustomFee,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("unable to scan order data: %w", err)
+		}
+
+		order.Delivery = delivery
+		order.Payment = payment
+
+		orders[order.OrderUID] = order
+	}
+
+	for orderUID := range orders {
+		itemRows, err := conn.Query(ctx, `
+            SELECT
+                chrt_id, track_number, price, rid, name, sale, size,
+                total_price, nm_id, brand, status
+            FROM items
+            WHERE order_uid = $1
+        `, orderUID)
+		if err != nil {
+			return nil, fmt.Errorf("unable to retrieve items for order %s from database: %w", orderUID, err)
+		}
+		defer itemRows.Close()
+
+		var items []model.Item
+		for itemRows.Next() {
+			var item model.Item
+			err := itemRows.Scan(
+				&item.ChrtID, &item.TrackNumber, &item.Price, &item.RID, &item.Name, &item.Sale,
+				&item.Size, &item.TotalPrice, &item.NmID, &item.Brand, &item.Status,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("unable to scan item data for order %s: %w", orderUID, err)
+			}
+			items = append(items, item)
+		}
+
+		order := orders[orderUID]
+		order.Items = items
+		orders[orderUID] = order
+	}
+
+	return orders, nil
 }
 
 // подписка на изменения
-func consumeData(ctx context.Context, nc *nats.Conn, dbConn *pgx.Conn) {
+func consumeData(ctx context.Context, nc *nats.Conn, dbConn *pgx.Conn, cache map[string]model.Order, cacheMx *sync.RWMutex) {
 	nc.QueueSubscribe("wbtech", "data", func(msg *nats.Msg) {
 		var receivedOrder model.Order
 		err := json.Unmarshal(msg.Data, &receivedOrder)
 		if err != nil {
-			log.Fatalf("Error unmarshaling message from NATS: %v", err)
+			log.Printf("Error unmarshaling message from NATS: %v", err)
+			return
 		}
-
 		// Сохранение данных в базу данных
 		err = saveOrderToDB(ctx, receivedOrder, dbConn)
 		if err != nil {
 			log.Fatalf("Error saving order to database: %v", err)
 		}
 		fmt.Println("Order saved to database")
+		cacheMx.Lock()
+		cache[receivedOrder.OrderUID] = receivedOrder
+		cacheMx.Unlock()
 	})
 }
 

@@ -1,0 +1,1 @@
+DATABASE_URL=postgres://debug:debug@db:5432/wbtech
