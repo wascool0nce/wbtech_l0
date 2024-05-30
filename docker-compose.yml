@@ -3,6 +3,10 @@ version: '3'
 volumes:
   local_postgres_data:
 
+networks:
+  proxynet:
+    driver: bridge
+
 services:
   db:
     image: postgres
@@ -13,17 +17,25 @@ services:
     volumes:
       - local_postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - proxynet
+
   
   nats:
     image: nats-streaming
     ports:
     - 4222:4222
+    networks:
+      - proxynet
   
-  nuts-server:
-    image: nats-streaming
+  server:
+    build:
+      context: .
+      dockerfile: compose/Dockerfile
     ports:
-      - "8222:8222"
-    env_file:
-      - .envs/.nuts
+      - "8080:8080"
+    networks:
+      - proxynet
     depends_on:
       - db
+      - nats

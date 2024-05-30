@@ -39,7 +39,7 @@ func main() {
 		},
 		Items: []model.Item{
 			{
-				ChrtID:      9934930,
+				ChrtID:      99349301,
 				TrackNumber: "WBILMTESTTRACK",
 				Price:       453,
 				RID:         "ab4219087a764ae0btest",
@@ -62,7 +62,7 @@ func main() {
 		OofShard:          "1",
 	}
 
-	// Подключение к NATS
+	// Подключение к NATS00
 	url := "nats://0.0.0.0:4222"
 	nc, err := nats.Connect(url)
 	if err != nil {
@@ -75,11 +75,16 @@ func main() {
 		log.Fatalf("Error marshaling order to JSON: %v", err)
 	}
 
-	// Публикация JSON в NATS
-	err = nc.Publish("wbtech", orderJSON)
+	ec, err := nats.NewEncodedConn(nc, nats.JSON_ENCODER)
 	if err != nil {
-		log.Fatalf("Error publishing message to NATS: %v", err)
+		log.Fatal(err)
+	}
+	defer ec.Close()
+
+	// Публикация JSON в NATS
+	nc.Publish("wbtech", orderJSON)
+	if err != nil {
+	 	log.Fatalf("Error publishing message to NATS: %v", err)
 	}
 	fmt.Println("Order published to NATS")
-
 }
